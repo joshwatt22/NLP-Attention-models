@@ -1,0 +1,1134 @@
+---
+title: "Evaluating the Performance of Different Compatibility Functions in Attention Models"
+author: "Joshua Watt"
+header-includes:
+   - \usepackage{float}
+   - \usepackage{hyperref}
+output:
+  pdf_document:
+    toc: yes
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  fig.width = 6, 
+  fig.asp = 0.618, 
+  out.width = "70%",
+  fig.align = "center", 
+  root.dir = '../'
+)
+```
+
+```{r, include=FALSE}
+# Packages
+pacman::p_load(ggplot2, ggpubr, devtools, keras, dplyr, tidyverse, tidytext, stopwords, reticulate, tensorflow, tfdatasets, purrr, stringr, reshape2, viridis, tibble, quanteda, quanteda.textplots)
+
+#library(tensorflow)
+#install_tensorflow()
+
+library(keras)
+use_implementation("tensorflow")
+
+library(tensorflow)
+```
+
+In this document, we will demonstrate some of the ideas from the paper on Attention in Natural Language Processing by Andrea Galassi, Marco Lippi and Paolo Torroni. The hyperlink for the paper is provided here: \url{https://arxiv.org/ftp/arxiv/papers/1902/1902.02181.pdf}. The beer review data set will be used for this demonstration - find the data set here: \url{https://github.com/YujiaBao/R2A}. This data set is split based upon whether the context of the review is surrounding the beer look, aroma or palate. Further, each review is either classified as being a positive (encoded as a 1) or negative (encoded as a 0) review surrounding the particular context. For this report, we will be considering only the reviews surrounding the beers look, however the same models can be applied to reviews surrounding the beers aroma or palate.
+
+# Loading Data
+
+First we load in the data and set aside some samples for visualization of attention in practice. In addition, we choose how many training and validation samples we're going to consider. Since the latter part of this demonstration contains significant computation, we limit the training set to 10000 reviews and the validation set to 2000 reviews.
+
+```{r, echo = FALSE}
+# Reading data into R
+beer_train <- read_delim("beer0.train", "\t", col_names = TRUE)
+beer_validate <- read_delim("beer0.dev", "\t", col_names = TRUE)
+
+# Setting aside some samples for visualization of attention
+positive_sample <- beer_validate$text[6001]
+negative_sample <- beer_validate$text[8]
+temp <- beer_validate[c(6001,8),]
+
+# Restricting training set
+train_size <- 10000
+rows <- sample(nrow(beer_train),train_size)
+beer <- beer_train[rows,]
+
+# Restricting validation set
+val_size <- 2000
+rows <- sample(nrow(beer_validate),val_size)
+beer_validate <- beer_validate[rows,]
+
+# Putting all the samples into one data frame
+beer <- rbind(beer, beer_validate, temp)
+```
+
+# EDA
+
+Now that we have loaded the data in, we can perform an Explanatory Data Analysis (EDA) of each of the sentences. This is demonstrated below.
+
+```{r}
+# Obtaining individual words
+beer_words <- beer %>%
+  unnest_tokens(word, text)
+beer_words
+
+# Popular words
+beer_words %>% 
+  count(word, sort=TRUE)
+
+# Popular words with stopwords removed
+beer_words <- anti_join(beer_words,get_stopwords())
+beer_words %>% 
+  count(word, sort=TRUE)
+```
+
+# Preprocessing
+
+Now we must preprocess the sentences so they can be used in our attention models. As part of this, we must remove all special characters from the sentences, insert spaces between words and create mappings between numbers and different words.
+
+## Formatting Sentences
+
+First we remove all special characters from the sentences, add spaces before punctuation and insert start and end tokens for each sentence.
+
+```{r}
+str_break = function(x, width = 80L) {
+  n = nchar(x)
+  if (n <= width) return(x)
+  n1 = seq(1L, n, by = width)
+  n2 = seq(width, n, by = width)
+  if (n %% width != 0) n2 = c(n2, n)
+  substring(x, n1, n2)
+}
+
+# Function to add a space before punctuation
+space_before_punct <- function(sentence) {
+  str_replace_all(sentence, "([?.!])", " \\1")
+}
+
+# Replacing all special characters
+replace_special_chars <- function(sentence) {
+  str_replace_all(sentence, c("[^a-zA-Z?.!,¿]+|\'|\\.|\\,|\\!|\\?"), ' ')
+}
+
+# Adding index to the start and end of a word
+add_startend <- function(sentence) {
+  paste0("<start> ", sentence, " <stop>")
+}
+add_tokens <- Vectorize(add_startend, USE.NAMES = FALSE)
+
+# Composing functions
+preprocess_sentence <- compose(add_startend,
+                               str_squish,
+                               replace_special_chars,
+                               space_before_punct)
+
+# Applying functions and displaying preprocessed sentence
+word_pairs <- map(beer$text, preprocess_sentence)
+strwrap(word_pairs[1], 80)
+```
+
+## Creating lookup indices
+
+We then create lookup indices for every word in the data set. This enables us to represent each word with a number and is necessary to perform our attention models on the data.
+
+```{r}
+# Padding words which are shorter than others
+create_index <- function(sentences) {
+  unique_words <- sentences %>% unlist() %>% paste(collapse = " ") %>%
+    str_split(pattern = " ") %>% .[[1]] %>% unique() %>% sort()
+  index <- data.frame(
+    word = unique_words,
+    index = 1:length(unique_words),
+    stringsAsFactors = FALSE
+  ) %>%
+    add_row(word = "<pad>",
+                    index = 0,
+                    .before = 1)
+  index
+}
+
+# Function which maps words to a number
+word2index <- function(word, index_df) {
+  index_df[index_df$word == word, "index"]
+}
+
+# Function which maps numbers to a word
+index2word <- function(index, index_df) {
+  index_df[index_df$index == index, "word"]
+}
+
+# Creating the mapping between words and numbers
+beer_index <- create_index(map(word_pairs, ~ .[[1]]))
+beer_index[1:30,]
+```
+
+## Converting sentences to matrices
+
+We then convert the sentences to matrices of numbers representing each individual word in the sentence. Each sentence is a row in the matrix and the numbers constitute the order of words appearing in the sentence.
+
+```{r}
+# Function mapping sentences to words
+sentence2digits <- function(sentence, index_df) {
+  map((sentence %>% str_split(pattern = " "))[[1]], function(word)
+    word2index(word, index_df))
+}
+
+# Function creating matrices of numbers from sentences
+sentlist2diglist <- function(sentence_list, index_df) {
+  map(sentence_list, function(sentence)
+    sentence2digits(sentence, index_df))
+}
+
+# Creating matrices of numbers from sentences
+beer_diglist <-
+  sentlist2diglist(map(word_pairs, ~ .[[1]]), beer_index)
+beer_maxlen <- map(beer_diglist, length) %>% unlist() %>% max()
+beer_matrix <-
+  pad_sequences(beer_diglist, maxlen = beer_maxlen,  padding = "post")
+```
+
+## Performing train-validation split
+
+We then perform the train-validation split.
+
+```{r}
+# Training data
+x_train <- beer_matrix[1:train_size,]
+y_train <- beer$label[1:train_size]
+
+# Validation data
+x_val <- beer_matrix[(train_size+1):(train_size + val_size),]
+y_val <- beer$label[(train_size+1):(train_size + val_size)]
+
+buffer_size <- nrow(x_train)
+```
+
+## Creating batches from training data set
+
+We will use a batch size of 20 for all models. We shuffle the training data set and create batches from it.
+
+```{r}
+# The batch size
+batch_size <- 20
+
+# Shuffling data and creating batches
+train_dataset <- 
+  tensor_slices_dataset(keras_array(list(x_train, y_train)))  %>%
+  dataset_shuffle(buffer_size = buffer_size) %>%
+  dataset_batch(batch_size, drop_remainder = TRUE)
+```
+
+# Additive Attention
+
+In this section, we will use a sequence model to classify each of the reviews as being a positive review or a negative review surrounding the look of the beer. To do this, we will adapt the general attention model discussed in Galassi's paper on Attention in Natural Language Processing. The encoder will consist of an embedding layer followed by a bidirectional RNN with 200 gated recurrent units - this will feed as an input into the attention model. The decoder will consist of two cascading elements: the attention model and a RNN. The RNN will contain one fully connected hidden layer with 50 hidden units and Relu activation and a fully connected output layer with one hidden unit and sigmoid activation. The attention model will use an additive compatibility function with tanh activation for the output and hidden states from the encoder. Lets explain this in a little more detail below.
+
+Let $f$ denote the compatibility function for our attention model. Moreover, let $K$ denote the output from the encoder and $q$ denote a concatenated version of the forward and backward hidden states from the bidirectional RNN in the encoder. The additive compatibility function we use is then of the form:
+$$
+f(q,K) = w_{\text{imp}}^T \tanh(W_1 K + W_2 q + b)
+$$
+where $W_1, W_2, w_{\text{imp}}, b$ are all parameters which require optimizing.
+
+## Attention Encoder
+
+We now create a function for the attention encoder described above.
+
+```{r}
+# Defining function for the encoder
+attention_encoder <-
+  
+  function(gru_units,
+           embedding_dim,
+           beer_vocab_size,
+           name = NULL) {
+    
+    # We use a custom keras model
+    keras_model_custom(name = name, function(self) {
+      
+      # Embedding layer
+      self$embedding <-
+        layer_embedding(
+          input_dim = beer_vocab_size,
+          output_dim = embedding_dim
+        )
+      
+      # Bidirectional GRU layer
+      self$gru <-
+          bidirectional(layer = layer_gru(units = gru_units,
+                    return_sequences = TRUE,
+                    return_state = TRUE))
+        
+      function(inputs, mask = NULL) {
+        
+        # defining inputs
+        x <- inputs[[1]]
+        hidden <- inputs[[2]]
+        
+        # Performing embedding followed by the bidirectional GRU layer
+        x <- self$embedding(x)
+        c(output, state_forward, state_backward) %<-% 
+          self$gru(x, initial_state = c(hidden, hidden))
+          
+        # Returning results
+        list(output, state_forward, state_backward)
+      }
+    })
+  }
+```
+
+## Attention Decoder
+
+We now create a function for the attention decoder described above.
+
+```{r}
+# Defining function for the decoder
+attention_decoder <-
+  function(object,
+           dense_units,
+           embedding_dim,
+           name = NULL) {
+    
+    # We use a custom keras model
+    keras_model_custom(name = name, function(self) {
+      
+      # First we have a dense layer with relu activation
+      self$dense <-
+        layer_dense(
+          units = 50,
+          activation = "relu"
+        )
+      
+      # Followed by another dense layer with sigmoid activation
+      self$sig <-
+        layer_dense(
+          units = 1,
+          activation = "sigmoid"
+        )
+      
+      # We then add layers for each of the parameters
+      # in the compatibility function
+      dense_units <- dense_units
+      self$W1 <- layer_dense(units = dense_units)
+      self$W2 <- layer_dense(units = dense_units)
+      self$V <- layer_dense(units = 1L)
+ 
+      function(inputs, mask = NULL) {
+        
+        # Defining inputs
+        hidden <- inputs[[1]]
+        encoder_output <- inputs[[2]]
+        
+        hidden_with_time_axis <- k_expand_dims(hidden, 2)
+        
+        # Calculating compatibility function
+        compatibility <- self$V(k_tanh(self$W1(encoder_output) + 
+                                 self$W2(hidden_with_time_axis)))
+        
+        # Calculating attention weights
+        attention_weights <- k_softmax(compatibility, axis = 2)
+        
+        # Calculating the context vector
+        context_vector <- attention_weights * encoder_output
+        context_vector <- k_sum(context_vector, axis = 2)
+        x <- k_expand_dims(context_vector, 2)
+        
+        # Performing dense layer followed by sigmoid layer
+        output %<-%  self$sig(self$dense(x))
+        
+        # Returning results
+        output <- output %>% k_concatenate() %>% k_concatenate()
+        list(output, attention_weights)
+      }
+      
+    })
+  }
+```
+
+## Creating the model
+
+We first define the hyper-parameters for the model.
+
+```{r}
+# Hyper-parameters
+batch_size <- 20
+embedding_dim <- 50
+gru_units <- 200
+dense_units <- 50
+beer_vocab_size <- nrow(beer_index)
+```
+
+We then define the encoder and decoder functions created above.
+
+```{r}
+# Encoder
+encoder <- attention_encoder(
+  gru_units = gru_units,
+  embedding_dim = embedding_dim,
+  beer_vocab_size = beer_vocab_size
+)
+
+# Decoder
+decoder <- attention_decoder(
+  dense_units = dense_units,
+  embedding_dim = embedding_dim
+)
+```
+
+We use the Adam optimizer to perform the gradient descent. We then define our functions for calculating loss and accuracy. Here we use binary cross entropy to calculate loss since this is a binary classification problem.
+
+```{r}
+# Adam optimizer
+optimizer <- tf$optimizers$Adam()
+
+# Loss function
+cx_loss <- function(y_true, y_pred) {
+  loss <-
+    k_binary_crossentropy(target = y_true, output = y_pred)
+  tf$reduce_mean(loss)
+}
+
+# Accuracy function
+cx_accuracy <- function(y_true, y_pred) {
+    metric_binary_accuracy(y_true, y_pred)
+}
+```
+
+We create a function which returns the prediction of a sentence from the model.
+
+```{r}
+# Function for obtaining the result of any given sentence
+get_result <- function(input){
+  
+  # Performing forward pass
+  input <- k_constant(input)
+  hidden <- k_zeros(c(nrow(input), gru_units))
+  c(enc_output, enc_hidden_forward, enc_hidden_backward) %<-% encoder(list(input, hidden))
+  dec_hidden <- k_concatenate(list(enc_hidden_backward,enc_hidden_forward))
+  c(preds, attention_weights) %<-%
+    decoder(list(dec_hidden, enc_output))
+  
+  # Returning prediction
+  return(ifelse(as.double(preds)>0.5,1,0))
+}
+```
+
+## Training the Model
+
+This block of code trains the model. Since this requires significant computation, we will only perform 5 epochs. Moreover, we store the accuracy and loss when performing the model on the training and validation set after every epoch.
+
+```{r, message=FALSE, warning=FALSE}
+# Setting number of epochs
+n_epochs <- 5
+
+# Setting up storage containers
+encoder_init_hidden <- k_zeros(c(batch_size, gru_units))
+train_loss_additive <- rep(NA, n_epochs)
+train_accuracy_additive <- rep(NA, n_epochs)
+val_loss_additive <- rep(NA, n_epochs)
+val_accuracy_additive <- rep(NA, n_epochs)
+batch_loss <- rep(NA, n_epochs*train_size/batch_size)
+
+# Setting start time
+start.time <- Sys.time()
+
+# Looping over epochs
+for (epoch in seq_len(n_epochs)) {
+  
+  total_loss <- 0
+  total_accuracy <- 0
+  iteration <- 0
+  
+  # Getting next iteration
+  iter <- make_iterator_one_shot(train_dataset)
+  
+  #Looping over batches
+  until_out_of_range({
+    
+    # Obtaining next batch
+    batch <- iterator_get_next(iter)
+    loss <- 0
+    accuracy <- 0
+    x <- batch[[1]]
+    y <- batch[[2]]
+    iteration <- iteration + 1
+    
+    # Performing forward and backward pass
+    with(tf$GradientTape() %as% tape, {
+      
+      # encoding the batch
+      c(enc_output, enc_hidden_forward, enc_hidden_backward) %<-% 
+        encoder(list(x, encoder_init_hidden))
+      
+      # Setting hidden decoder state to encoder hidden states
+      dec_hidden <- k_concatenate(list(enc_hidden_backward,enc_hidden_forward))
+      
+      # decoding the batch
+      c(preds, weights) %<-%
+          decoder(list(dec_hidden, enc_output))
+      
+      # Calculating batch loss and accuracy
+      loss <- loss + cx_loss(y, preds)
+      accuracy <- cx_accuracy(y, preds)
+    })
+      
+    # Obtaining batch gradients
+    variables <- c(encoder$variables, decoder$variables)
+    gradients <- tape$gradient(loss, variables)
+    
+    # Performing gradient descent update
+    optimizer$apply_gradients(purrr::transpose(list(gradients, variables)))
+      
+  })
+  
+  # Obtaining predictions for training and validation sets
+  y_pred_train <- k_constant(get_result(x_train))
+  y_pred_val <- k_constant(get_result(x_val))
+  
+  # Updating training and validation loss and accuracy for the epoch
+  train_loss_additive[epoch] <-
+    (cx_loss(k_constant(y_train), y_pred_train)) %>%
+    as.double()
+  val_loss_additive[epoch] <-
+    (cx_loss(k_constant(y_val), y_pred_val)) %>%
+    as.double()
+  train_accuracy_additive[epoch] <-
+    (cx_accuracy(k_constant(y_train), y_pred_train)) %>%
+    as.double()
+  val_accuracy_additive[epoch] <-
+    (cx_accuracy(k_constant(y_val), y_pred_val)) %>%
+    as.double()
+}
+
+# Setting end time
+end.time <- Sys.time()
+
+# Returning time taken
+time.taken <- end.time - start.time
+time.taken
+```
+
+## Evaluating the model
+
+The following functions allow us to evaluate the model obtained above.
+
+```{r}
+# Function for calculating sentence result and attention vector
+evaluate <-
+  function(sentence) {
+    attention_vector <- rep(0, beer_maxlen)
+    
+    # Preprocess sentence
+    sentence <- preprocess_sentence(sentence)
+    input <- sentence2digits(sentence, beer_index)
+    input <- input %>% unlist() %>% list()
+    input <-
+      pad_sequences(input, maxlen = beer_maxlen,  padding = "post")
+    input <- k_constant(input)
+    
+    # Perform forward pass
+    hidden <- k_zeros(c(1, gru_units))
+    c(enc_output, enc_hidden_forward, enc_hidden_backward) %<-% encoder(list(input, hidden))
+    dec_hidden <- k_concatenate(list(enc_hidden_backward,enc_hidden_forward))
+    c(preds, attention_weights) %<-%
+        decoder(list(dec_hidden, enc_output))
+    
+    #Calculating the attention vector
+    attention_weights <- k_reshape(attention_weights, c(-1))
+    attention_vector <- attention_weights %>% as.double()
+    
+    # Calculating our prediction
+    result <- ifelse(as.double(preds)>0.5,1,0)
+    
+    # Returning results
+    list(result, sentence, attention_vector)
+  }
+```
+
+```{r}
+# Function for plotting a word cloud of the attention vector results
+plot_attention <-
+  function(sentence) {
+    
+    # Evaluating sentence and determining colour of wordcloud
+    c(result, sentence, attention_vector) %<-% evaluate(sentence)
+    result <- ifelse(result==1,"green","red")
+    
+    # Processing attention vector and scaling scores out of 100
+    attention_vector <- attention_vector[1:length(str_split(sentence, " ")[[1]])]
+    attention_vector <- attention_vector[-c(1,length(attention_vector))]
+    attention_vector <- 100*attention_vector/max(attention_vector)
+    
+    # Processing sentence
+    sentence <- unlist(strsplit(sentence, " "))
+    sentence <- sentence[-c(1,length(sentence))]
+    attention_vector <- round(attention_vector)
+    sentence_rep <- rep(sentence, times = attention_vector)
+    
+    # Displaying wordcloud
+    sentence_rep %>%
+      dfm() %>%
+      textplot_wordcloud(color = result)
+  }
+```
+
+```{r}
+# Function to translate a sentence and provide prediction
+translate <- function(sentence, true) {
+  
+  # Evaluating sentence
+  c(result, sentence, attention_vector) %<-% evaluate(sentence)
+  
+  # Processing sentence result
+  sentence <- unlist(strsplit(sentence, " "))
+  sentence <- sentence[-c(1,length(sentence))]
+  sentence <- paste(sentence, collapse = " ")
+  
+  # Printing input, prediction and true result
+  result <- ifelse(result==1,"Positive","Negative")
+  true <- ifelse(true==1,"Positive","Negative")
+  return(list(paste0("Input: ",  sentence),
+              paste0("Predicted translation: ", result),
+              paste0("True translation: ", true)))
+}
+```
+
+We display the loss and accuracy for both the training set and validation set after each epoch.
+
+```{r, fig.cap = "Loss and Accuracy on training and validation sets for additive attention model."}
+dat1 <- data.frame("data" = as.factor(c(rep("Training", n_epochs),
+      rep("Validation", n_epochs))), "epoch" = rep(1:n_epochs,2),
+      "loss"=c(train_loss_additive, val_loss_additive))
+dat2 <- data.frame("data" = as.factor(c(rep("Training", n_epochs),
+      rep("Validation", n_epochs))), "epoch" = rep(1:n_epochs,2),
+      "accuracy"=c(train_accuracy_additive, val_accuracy_additive))
+
+# Plotting results
+p <- ggplot(dat1, aes(x = epoch, y = loss)) + 
+  geom_point(aes(col=data)) +
+  geom_line(aes(col=data)) +
+  ggtitle("Training and Validation Sets Loss and Accuracy over Epochs")
+q <- ggplot(dat2, aes(x = epoch, y = accuracy)) + 
+  geom_point(aes(col=data)) +
+  geom_line(aes(col=data)) +
+  ylim(0,1)
+
+ggarrange(p, q, ncol = 1, nrow = 2, common.legend = TRUE, legend = "right")
+```
+
+We predict the result of a negative review and display its word cloud below.
+
+```{r, fig.cap = "Wordcloud of a negative review."}
+c(sentence, prediction, true_result) %<-% translate(negative_sample, 1)
+strwrap(sentence,80)
+prediction
+true_result
+plot_attention(negative_sample)
+```
+
+We predict the result of a positive review and display its word cloud below.
+
+```{r, fig.cap = "Wordcloud of a positive review."}
+c(sentence, prediction, true_result) %<-% translate(positive_sample, 1)
+strwrap(sentence,80)
+prediction
+true_result
+plot_attention(positive_sample)
+```
+
+# Multiplicative Attention
+
+This attention model will now use a multiplicative compatibility function for the output and hidden states from the encoder. Lets explain this in a little more detail below.
+
+Let $f$ denote the compatibility function for our attention model. Moreover, let $K$ denote the output from the encoder and $q$ denote a concatenated version of the forward and backward hidden states from the bidirectional RNN in the encoder. The multiplicative compatibility function we use is then of the form:
+$$
+f(q,K) = w_{\text{imp}}^Tq^TK.
+$$
+where $w_{\text{imp}}$ is a trainable parameter.
+
+## Attention Decoder
+
+We now create a function for the attention decoder described above.
+
+```{r}
+# Defining function for the decoder
+attention_decoder <-
+  function(object,
+           dense_units,
+           embedding_dim,
+           name = NULL) {
+    
+    # We use a custom keras model
+    keras_model_custom(name = name, function(self) {
+      
+      # First we have a dense layer with relu activation
+      self$dense <-
+        layer_dense(
+          units = 50,
+          activation = "relu"
+        )
+      
+      # Followed by another dense layer with sigmoid activation
+      self$sig <-
+        layer_dense(
+          units = 1,
+          activation = "sigmoid"
+        )
+      
+      # We then add layers for each of the parameters
+      # in the compatibility function
+      dense_units <- dense_units
+      self$V <- layer_dense(units = 1L)
+ 
+      function(inputs, mask = NULL) {
+        
+        # Defining inputs
+        hidden <- inputs[[1]]
+        encoder_output <- inputs[[2]]
+        
+        hidden_with_time_axis <- k_expand_dims(hidden, 2)
+        
+        # Calculating compatibility function
+        compatibility <- self$V(hidden_with_time_axis*encoder_output)
+        
+        # Calculating attention weights
+        attention_weights <- k_softmax(compatibility, axis = 2)
+        
+        # Calculating the context vector
+        context_vector <- attention_weights * encoder_output
+        context_vector <- k_sum(context_vector, axis = 2)
+        x <- k_expand_dims(context_vector, 2)
+        
+        # Performing dense layer followed by sigmoid layer
+        output %<-%  self$sig(self$dense(x))
+        
+        # Returning results
+        output <- output %>% k_concatenate() %>% k_concatenate()
+        list(output, attention_weights)
+      }
+      
+    })
+  }
+```
+
+```{r}
+# Decoder
+decoder <- attention_decoder(
+  dense_units = dense_units,
+  embedding_dim = embedding_dim
+)
+```
+
+```{r, include = FALSE}
+rm(tape,iter)
+```
+
+## Training the Model
+
+This block of code trains the model. Since this requires significant computation, we will only perform 5 epochs. Moreover, we store the accuracy and loss when performing the model on the training and validation set after every epoch.
+
+```{r, message=FALSE, warning=FALSE}
+# Setting number of epochs
+n_epochs <- 5
+
+# Setting up storage containers
+encoder_init_hidden <- k_zeros(c(batch_size, gru_units))
+train_loss_multiplicative <- rep(NA, n_epochs)
+train_accuracy_multiplicative <- rep(NA, n_epochs)
+val_loss_multiplicative <- rep(NA, n_epochs)
+val_accuracy_multiplicative <- rep(NA, n_epochs)
+
+# Setting start time
+start.time <- Sys.time()
+
+# Looping over epochs
+for (epoch in seq_len(n_epochs)) {
+  
+  total_loss <- 0
+  total_accuracy <- 0
+  iteration <- 0
+  
+  # Getting next iteration
+  iter <- make_iterator_one_shot(train_dataset)
+  
+  #Looping over batches
+  until_out_of_range({
+    
+    # Obtaining next batch
+    batch <- iterator_get_next(iter)
+    loss <- 0
+    accuracy <- 0
+    x <- batch[[1]]
+    y <- batch[[2]]
+    iteration <- iteration + 1
+    
+    # Performing forward and backward pass
+    with(tf$GradientTape() %as% tape, {
+      
+      # encoding the batch
+      c(enc_output, enc_hidden_forward, enc_hidden_backward) %<-% 
+        encoder(list(x, encoder_init_hidden))
+      
+      # Setting hidden decoder state to encoder hidden states
+      dec_hidden <- k_concatenate(list(enc_hidden_backward,enc_hidden_forward))
+      
+      # decoding the batch
+      c(preds, weights) %<-%
+          decoder(list(dec_hidden, enc_output))
+      
+      # Calculating batch loss and accuracy
+      loss <- loss + cx_loss(y, preds)
+      accuracy <- cx_accuracy(y, preds)
+    })
+      
+    # Obtaining batch gradients
+    variables <- c(encoder$variables, decoder$variables)
+    gradients <- tape$gradient(loss, variables)
+    
+    # Performing gradient descent update
+    optimizer$apply_gradients(purrr::transpose(list(gradients, variables)))
+      
+  })
+  
+  # Obtaining predictions for training and validation sets
+  y_pred_train <- k_constant(get_result(x_train))
+  y_pred_val <- k_constant(get_result(x_val))
+  
+  # Updating training and validation loss and accuracy for the epoch
+  train_loss_multiplicative[epoch] <-
+    (cx_loss(k_constant(y_train), y_pred_train)) %>%
+    as.double()
+  val_loss_multiplicative[epoch] <-
+    (cx_loss(k_constant(y_val), y_pred_val)) %>%
+    as.double()
+  train_accuracy_multiplicative[epoch] <-
+    (cx_accuracy(k_constant(y_train), y_pred_train)) %>%
+    as.double()
+  val_accuracy_multiplicative[epoch] <-
+    (cx_accuracy(k_constant(y_val), y_pred_val)) %>%
+    as.double()
+}
+
+# Setting end time
+end.time <- Sys.time()
+
+# Returning time taken
+time.taken <- end.time - start.time
+time.taken
+```
+
+## Evaluating the model
+
+We display the loss and accuracy for both the training set and validation set after each epoch.
+
+```{r, fig.cap = "Loss and Accuracy on training and validation sets for multiplicative attention model."}
+dat1 <- data.frame("data" = as.factor(c(rep("Training", n_epochs),
+      rep("Validation", n_epochs))), "epoch" = rep(1:n_epochs,2),
+      "loss"=c(train_loss_multiplicative, val_loss_multiplicative))
+dat2 <- data.frame("data" = as.factor(c(rep("Training", n_epochs),
+      rep("Validation", n_epochs))), "epoch" = rep(1:n_epochs,2),
+      "accuracy"=c(train_accuracy_multiplicative, val_accuracy_multiplicative))
+
+# Plotting results
+p <- ggplot(dat1, aes(x = epoch, y = loss)) + 
+  geom_point(aes(col=data)) +
+  geom_line(aes(col=data)) +
+  ggtitle("Training and Validation Sets Loss and Accuracy over Epochs")
+q <- ggplot(dat2, aes(x = epoch, y = accuracy)) + 
+  geom_point(aes(col=data)) +
+  geom_line(aes(col=data)) +
+  ylim(0,1)
+
+ggarrange(p, q, ncol = 1, nrow = 2, common.legend = TRUE, legend = "right")
+```
+
+We predict the result of a negative review and display its word cloud below.
+
+```{r, fig.cap = "Wordcloud of a negative review."}
+c(sentence, prediction, true_result) %<-% translate(negative_sample, 1)
+strwrap(sentence,80)
+prediction
+true_result
+plot_attention(negative_sample)
+```
+
+We predict the result of a positive review and display its word cloud below.
+
+```{r, fig.cap = "Wordcloud of a positive review."}
+c(sentence, prediction, true_result) %<-% translate(positive_sample, 1)
+strwrap(sentence,80)
+prediction
+true_result
+plot_attention(positive_sample)
+```
+
+# Activated General Attention
+
+This attention model will now use a activated general compatibility function with tanh activation for the output and hidden states from the encoder. Lets explain this in a little more detail below.
+
+Let $f$ denote the compatibility function for our attention model. Moreover, let $K$ denote the output from the encoder and $q$ denote a concatenated version of the forward and backward hidden states from the bidirectional RNN in the encoder. The activated general compatibility function we use is then of the form:
+$$
+f(q,K) = w_{\text{imp}}^T \tanh (q^TWK + b)
+$$
+where $w_{\text{imp}},W,b$ are trainable parameters.
+
+We firstly define the new attention decoder below.
+
+## Attention Decoder
+
+We now create a function for the attention decoder described above.
+
+```{r}
+# Defining function for the decoder
+attention_decoder <-
+  function(object,
+           dense_units,
+           embedding_dim,
+           name = NULL) {
+    
+    # We use a custom keras model
+    keras_model_custom(name = name, function(self) {
+      
+      # First we have a dense layer with relu activation
+      self$dense <-
+        layer_dense(
+          units = 50,
+          activation = "relu"
+        )
+      
+      # Followed by another dense layer with sigmoid activation
+      self$sig <-
+        layer_dense(
+          units = 1,
+          activation = "sigmoid"
+        )
+      
+      # We then add layers for each of the parameters
+      # in the compatibility function
+      dense_units <- dense_units
+      self$V <- layer_dense(units = 1L)
+      self$W <- layer_dense(units = dense_units)
+      
+      function(inputs, mask = NULL) {
+        
+        # Defining inputs
+        hidden <- inputs[[1]]
+        encoder_output <- inputs[[2]]
+        
+        hidden_with_time_axis <- k_expand_dims(hidden, 2)
+        
+        # Calculating compatibility function
+        compatibility <- self$V(k_tanh(self$W(hidden_with_time_axis*encoder_output)))
+        
+        # Calculating attention weights
+        attention_weights <- k_softmax(compatibility, axis = 2)
+        
+        # Calculating the context vector
+        context_vector <- attention_weights * encoder_output
+        context_vector <- k_sum(context_vector, axis = 2)
+        x <- k_expand_dims(context_vector, 2)
+        
+        # Performing dense layer followed by sigmoid layer
+        output %<-%  self$sig(self$dense(x))
+        
+        # Returning results
+        output <- output %>% k_concatenate() %>% k_concatenate()
+        list(output, attention_weights)
+      }
+      
+    })
+  }
+```
+
+```{r}
+# Decoder
+decoder <- attention_decoder(
+  dense_units = dense_units,
+  embedding_dim = embedding_dim
+)
+```
+
+```{r, include = FALSE}
+rm(tape,iter)
+```
+
+## Training the Model
+
+This block of code trains the model. Since this requires significant computation, we will only perform 5 epochs. Moreover, we store the accuracy and loss when performing the model on the training and validation set after every epoch.
+
+```{r, message=FALSE, warning=FALSE}
+# Setting number of epochs
+n_epochs <- 5
+
+# Setting up storage containers
+encoder_init_hidden <- k_zeros(c(batch_size, gru_units))
+train_loss_act <- rep(NA, n_epochs)
+train_accuracy_act <- rep(NA, n_epochs)
+val_loss_act <- rep(NA, n_epochs)
+val_accuracy_act <- rep(NA, n_epochs)
+
+# Setting start time
+start.time <- Sys.time()
+
+# Looping over epochs
+for (epoch in seq_len(n_epochs)) {
+  
+  total_loss <- 0
+  total_accuracy <- 0
+  iteration <- 0
+  
+  # Getting next iteration
+  iter <- make_iterator_one_shot(train_dataset)
+  
+  #Looping over batches
+  until_out_of_range({
+    
+    # Obtaining next batch
+    batch <- iterator_get_next(iter)
+    loss <- 0
+    accuracy <- 0
+    x <- batch[[1]]
+    y <- batch[[2]]
+    iteration <- iteration + 1
+    
+    # Performing forward and backward pass
+    with(tf$GradientTape() %as% tape, {
+      
+      # encoding the batch
+      c(enc_output, enc_hidden_forward, enc_hidden_backward) %<-% 
+        encoder(list(x, encoder_init_hidden))
+      
+      # Setting hidden decoder state to encoder hidden states
+      dec_hidden <- k_concatenate(list(enc_hidden_backward,enc_hidden_forward))
+      
+      # decoding the batch
+      c(preds, weights) %<-%
+          decoder(list(dec_hidden, enc_output))
+      
+      # Calculating batch loss and accuracy
+      loss <- loss + cx_loss(y, preds)
+      accuracy <- cx_accuracy(y, preds)
+    })
+      
+    # Obtaining batch gradients
+    variables <- c(encoder$variables, decoder$variables)
+    gradients <- tape$gradient(loss, variables)
+    
+    # Performing gradient descent update
+    optimizer$apply_gradients(purrr::transpose(list(gradients, variables)))
+      
+  })
+  
+  # Obtaining predictions for training and validation sets
+  y_pred_train <- k_constant(get_result(x_train))
+  y_pred_val <- k_constant(get_result(x_val))
+  
+  # Updating training and validation loss and accuracy for the epoch
+  train_loss_act[epoch] <-
+    (cx_loss(k_constant(y_train), y_pred_train)) %>%
+    as.double()
+  val_loss_act[epoch] <-
+    (cx_loss(k_constant(y_val), y_pred_val)) %>%
+    as.double()
+  train_accuracy_act[epoch] <-
+    (cx_accuracy(k_constant(y_train), y_pred_train)) %>%
+    as.double()
+  val_accuracy_act[epoch] <-
+    (cx_accuracy(k_constant(y_val), y_pred_val)) %>%
+    as.double()
+}
+
+# Setting end time
+end.time <- Sys.time()
+
+# Returning time taken
+time.taken <- end.time - start.time
+time.taken
+```
+
+## Evaluating the model
+
+We display the loss and accuracy for both the training set and validation set after each epoch.
+
+```{r, fig.cap = "Loss and Accuracy on training and validation sets for activated general attention model."}
+dat1 <- data.frame("data" = as.factor(c(rep("Training", n_epochs),
+      rep("Validation", n_epochs))), "epoch" = rep(1:n_epochs,2),
+      "loss"=c(train_loss_act, val_loss_act))
+dat2 <- data.frame("data" = as.factor(c(rep("Training", n_epochs),
+      rep("Validation", n_epochs))), "epoch" = rep(1:n_epochs,2),
+      "accuracy"=c(train_accuracy_act, val_accuracy_act))
+
+# Plotting results
+p <- ggplot(dat1, aes(x = epoch, y = loss)) + 
+  geom_point(aes(col=data)) +
+  geom_line(aes(col=data)) +
+  ggtitle("Training and Validation Sets Loss and Accuracy over Epochs")
+q <- ggplot(dat2, aes(x = epoch, y = accuracy)) + 
+  geom_point(aes(col=data)) +
+  geom_line(aes(col=data)) +
+  ylim(0,1)
+
+ggarrange(p, q, ncol = 1, nrow = 2, common.legend = TRUE, legend = "right")
+```
+
+We predict the result of a negative review and display its word cloud below.
+
+```{r, fig.cap = "Wordcloud of a negative review."}
+c(sentence, prediction, true_result) %<-% translate(negative_sample, 1)
+strwrap(sentence,80)
+prediction
+true_result
+plot_attention(negative_sample)
+```
+
+We predict the result of a positive review and display its word cloud below.
+
+```{r, fig.cap = "Wordcloud of a positive review."}
+c(sentence, prediction, true_result) %<-% translate(positive_sample, 1)
+strwrap(sentence,80)
+prediction
+true_result
+plot_attention(positive_sample)
+```
+
+# Assessing the three attention models
+
+```{r, fig.cap = "Assessing the three attention models."}
+
+val_accuracy_additive
+
+val_accuracy_multiplicative
+
+val_accuracy_act
+
+dat1 <- data.frame("model" = as.factor(c(rep("Additive Model", n_epochs),
+      rep("Multiplicative Model", n_epochs),
+      rep("Activated General Model", n_epochs))), "epoch" = rep(1:n_epochs,3),
+      "loss"=c(val_loss_additive,val_loss_multiplicative,val_loss_act))
+dat2 <- data.frame("model" = as.factor(c(rep("Additive Model", n_epochs),
+      rep("Multiplicative Model", n_epochs),
+      rep("Activated General Model", n_epochs))), "epoch" = rep(1:n_epochs,3),
+      "accuracy"=c(val_accuracy_additive, val_accuracy_multiplicative,
+                   val_accuracy_act))
+
+# Plotting results
+p <- ggplot(dat1, aes(x = epoch, y = loss)) + 
+  geom_point(aes(col=model)) +
+  geom_line(aes(col=model)) +
+  ggtitle("Validation Set Loss and Accuracy for each model")
+q <- ggplot(dat2, aes(x = epoch, y = accuracy)) + 
+  geom_point(aes(col=model)) +
+  geom_line(aes(col=model)) +
+  ylim(0,1)
+
+ggarrange(p, q, ncol = 1, nrow = 2, common.legend = TRUE, legend = "right")
+```
+
+
+
+
+
+
+
+Link to course website: \url{https://deeplearningmath.org/}
